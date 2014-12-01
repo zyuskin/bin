@@ -5,6 +5,7 @@
 SITES_DIR=/Users/zyuskin_en/Sites/
 HTTPD_CONFIG_DIR=/etc/apache2/other/
 DOMAIN_SUFFIX=dev
+APACHECTL=`which apachectl`
 
 NEED_RESTART=0
 
@@ -45,6 +46,4 @@ for site in $sites; do
 done;
 
 
-if [ $NEED_RESTART -eq 1 ]; then
-    apachectl restart
-fi
+[ $NEED_RESTART -eq 1 ] && $APACHECTL restart
