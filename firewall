@@ -1,0 +1,537 @@
+#!/bin/bash
+
+RET_ARR=()
+UNAME=`uname`
+DEBUG=0
+IPTABLES=`which iptables`
+IPFW="/usr/bin/ipfw"
+RULES_FILE=/etc/firewall.rules
+LOG_FILE=/var/log/firewall.log
+SAVE=yes
+ALWAYS_SAVE=no
+
+[ -f /root/.firewallrc ] && . /root/.firewallrc
+
+[ "$EDITOR" = "" ] && EDITOR=mcedit
+
+if [ "$UNAME" = "Darwin" ]; then
+    MD5="md5 -r "
+else
+    MD5="md5sum "
+fi
+
+# Find str $2 in str $1
+Pos(){
+    Str=$1
+    Arg=$2
+    i=0
+    while [  $i -lt ${#Str} ]; do
+        Sim=${Str:$i:1}
+	if [ "$Sim" = "$Arg" ] ; then
+	    return $i
+	fi
+	let i=i+1
+    done
+    return 0
+}
+
+ExplodeStr(){
+    RET_ARR=()
+    Str=$1
+    Sep=$2
+    i=0
+    arr=$(echo $Str | tr "$Sep" "\n") 
+    for x in $arr; do
+		RET_ARR[$i]=$x
+		let i=i+1
+    done
+}
+
+log(){
+	message=$1
+	echo "$LOGNAME `date` $message"  >> $LOG_FILE
+}
+
+set_varible(){
+	name=$1
+	value=$2
+	eval $name=$value
+}
+
+flush(){
+
+    if [ "$UNAME" = "Darwin" ] || [ "$UNAME" = "FreeBSD" ]; then
+    	$IPFW -f flush
+    else
+		$IPTABLES -F
+		$IPTABLES -F INPUT
+		$IPTABLES -F OUTPUT
+		$IPTABLES -F FORWARD
+		$IPTABLES -F -t nat
+	fi;
+}
+
+established(){
+	if [ "$UNAME" = "Darwin" ] || [ "$UNAME" = "FreeBSD" ]; then
+		$IPFW add allow all from any to any established
+	else
+		$IPTABLES -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+		$IPTABLES -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+		$IPTABLES -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+	fi
+}
+
+trusted_int(){
+    interfases="$1"
+
+    int_list=${interfases//,/ }
+    for x in $int_list; do
+    	rules "allow all from any to me via $x"
+    done;
+}
+
+INPUT(){
+	_action=$1
+	_via=$2
+	_proto=$3
+	_from=$4
+	_from_port=$5
+	_to_port=$6
+	
+	[ "$_via" != "" ] && _via="-i $_via"
+	[ "$_proto" != "all" ] && _proto="-p $_proto" || _proto=""
+
+    echo $_to_port | grep "," > /dev/null 2>&1; po=$?
+    if [ $po -eq 0 ]; then
+		_to_port="-m multiport --dports $_to_port"
+    else
+		[ "$_to_port" = "" ] && _to_port="" || _to_port="--dport $_to_port"
+    fi
+
+    echo $_from_port | grep "," > /dev/null 2>&1; po=$?
+    if [ $po -eq 0 ]; then
+		_from_port="-m multiport --sports $_from_port"
+    else
+		[ "$_from_port" = "" ] && _from_port="" || _from_port="--sport $_from_port"
+    fi
+	
+	if [[ "$_to_port" != "" && ("$_proto" != "-p udp" && "$_proto" != "-p tcp") ]]; then
+		echo "Error input: port set but protocol not tcp or udp";
+	else
+    	echo $_from | grep "," > /dev/null 2>&1; po=$?
+    	if [ $po -eq 0 ]; then
+    		_hosts=${_from//,/ }
+    		for _from in $_hosts; do
+    			$IPTABLES -A INPUT $_via $_proto -s $_from $_from_port $_to_port -j $_action
+    		done;
+		else
+			[ "$_from" != "any" ] && _from="-s $_from" || _from=""
+			$IPTABLES -A INPUT $_via $_proto $_from $_from_port $_to_port -j $_action
+		fi
+	fi
+}
+
+OUTPUT(){
+	_action=$1
+	_via=$2
+	_proto=$3
+	_to=$4
+	_to_port=$5
+	
+	[ "$_via" != "" ] && _via="-o $_via"
+	[ "$_proto" != "all" ] && _proto="-p $_proto" || _proto=""
+	[ "$_to" != "any" ] && _to=" -d $_to" || _to=""
+    echo $_to_port | grep "," > /dev/null 2>&1; po=$?
+    if [ $po -eq 0 ]; then
+		_to_port="-m multiport --dports $_to_port"
+    else
+		[ "$_to_port" = "" ] && _to_port="" || _to_port="--dport $_to_port"
+    fi
+	
+	if [[ "$_to_port" != "" && ("$_proto" != "-p udp" && "$_proto" != "-p tcp") ]]; then
+		echo "Error output: port set but protocol not tcp udp";
+	else
+		$IPTABLES -A OUTPUT $_via $_proto $_to $_to_port -j $_action
+	fi
+}
+
+FORWARD(){
+	_action=$1
+	_via=$2
+	_proto=$3
+	_from=$4
+	_from_port=$5
+	_to=$6
+	_to_port=$7
+
+	[ "$_via" != "" ] && _via="-i $via"
+	[ "$_proto" != "all" ] && _proto="-p $_proto" || _proto=""
+	[ "$_from" != "any" ] && _from="-s $_from" || _from=""
+	[ "$_to" != "any" ] && _to="-d $_to" || _to=""
+	
+    echo $_to_port | grep "," > /dev/null 2>&1; po=$?
+    if [ $po -eq 0 ]; then
+		_to_port="-m multiport --dports $_to_port"
+    else
+		[ "$_to_port" = "" ] && _to_port="" || _to_port="--dport $_to_port"
+    fi
+
+    echo $_from_port | grep "," > /dev/null 2>&1; po=$?
+    if [ $po -eq 0 ]; then
+		_from_port="-m multiport --sports $_from_port"
+    else
+		[ "$_from_port" = "" ] && _from_port="" || _from_port="--sport $_from_port"
+    fi
+	
+	if [[ "$_to_port" != "" && ("$_proto" != "-p udp" && "$_proto" != "-p tcp") ]]; then
+		echo "Error forward: port set but protocol not tcp or udp";
+	else
+		$IPTABLES -A FORWARD $_via $_proto $_from $_from_port $_to $_to_port -j $_action
+	fi
+}
+
+SNAT(){
+	_ip=$1
+	_via=$2
+	_from=$3
+	_from_port=$4
+	_to=$5
+	_to_port=$6
+	
+	[ "$_via" != "" ] && _via="-o $via"
+	[ "$_proto" != "all" ] && _proto="-p $_proto" || _proto=""
+	[ "$_from" != "any" ] && _from="-s $_from" || _from=""
+	[ "$_to" != "any" ] && _to="-d $_to" || _to=""
+	
+    echo $_to_port | grep "," > /dev/null 2>&1; po=$?
+    if [ $po -eq 0 ]; then
+		_to_port="-m multiport --dports $_to_port"
+    else
+		[ "$_to_port" = "" ] && _to_port="" || _to_port="--dport $_to_port"
+    fi
+
+    echo $_from_port | grep "," > /dev/null 2>&1; po=$?
+    if [ $po -eq 0 ]; then
+		_from_port=" -m multiport --sports $_from_port"
+    else
+		[ "$_from_port" = "" ] && _from_port="" || _from_port="--sport $_from_port"
+    fi
+	
+	if [[ "$_to_port" != "" && ("$_proto" != "-p udp" && "$_proto" != "-p tcp") ]]; then
+		echo "Error forward: port set but protocol not tcp or udp";
+	else
+		$IPTABLES -t nat -A POSTROUTING $_from $_from_port $_to $_to_port $_via -j SNAT --to-source $_ip
+	fi
+}
+
+MASQ(){
+	_via=$1
+	_from=$2
+	_from_port=$3
+	_to=$4
+	_to_port=$5
+	
+	[ "$_via" != "" ] && _via="-o $via"
+	[ "$_proto" != "all" ] && _proto="-p $_proto" || _proto=""
+	[ "$_from" != "any" ] && _from="-s $_from" || _from=""
+	[ "$_to" != "any" ] && _to="-d $_to" || _to=""
+	
+    echo $_to_port | grep "," > /dev/null 2>&1; po=$?
+    if [ $po -eq 0 ]; then
+		_to_port="-m multiport --dports $_to_port"
+    else
+		[ "$_to_port" = "" ] && _to_port="" || _to_port="--dport $_to_port"
+    fi
+
+    echo $_from_port | grep "," > /dev/null 2>&1; po=$?
+    if [ $po -eq 0 ]; then
+		_from_port=" -m multiport --sports $_from_port"
+    else
+		[ "$_from_port" = "" ] && _from_port="" || _from_port="--sport $_from_port"
+    fi
+	
+	if [[ "$_to_port" != "" && ("$_proto" != "-p udp" && "$_proto" != "-p tcp") ]]; then
+		echo "Error forward: port set but protocol not tcp or udp";
+	else
+		$IPTABLES -t nat -A POSTROUTING $_from $_from_port $_to $_to_port $_via -j MASQUERADE
+	fi
+}
+
+
+DNAT(){
+	_dst=$1
+	_via=$2
+	_proto=$3
+	_from=$4
+	_from_port=$5
+	_to=$6
+	_to_port=$7
+	
+	[ "$_via" != "" ] && _via="-i $via"
+	[ "$_proto" != "all" ] && _proto="-p $_proto" || _proto=""
+	[ "$_from" != "any" ] && _from="-s $_from" || _from=""
+	[ "$_to" != "any" ] && _to="-d $_to" || _to=""
+	
+    echo $_to_port | grep "," > /dev/null 2>&1; po=$?
+    if [ $po -eq 0 ]; then
+		_to_port=" -m multiport --dports $_to_port"
+    else
+		[ "$_to_port" = "" ] && _to_port="" || _to_port="--dport $_to_port"
+    fi
+
+    echo $_from_port | grep "," > /dev/null 2>&1; po=$?
+    if [ $po -eq 0 ]; then
+		_from_port="-m multiport --sports $_from_port"
+    else
+		[ "$_from_port" = "" ] && _from_port="" || _from_port="--sport $_from_port"
+    fi
+	
+	if [[ "$_to_port" != "" && ("$_proto" != "-p udp" && "$_proto" != "-p tcp") ]]; then
+		echo "Error forward: port set but protocol not tcp";
+	else
+		if [ "$_to" = "-d me" ]; then
+			_to=""
+			_action="DNAT --to-destination $_dst"
+		else
+			_action="REDIRECT --to-port $_dst"
+		fi
+		$IPTABLES -t nat -A PREROUTING $_via $_proto $_from $_from_port $_to $_to_port -j $_action
+	fi
+
+}
+
+rules(){
+    src_str=$1
+    act=""
+    proto="all"
+    from="any"
+    from_port=""
+    to="any"
+    to_port=""
+    via=""
+    direction=""
+    log=""
+    divert_type=""
+    snat_ip=""
+    dnat_dst=""
+
+    if [ "$UNAME" = "Darwin" ] || [ "$UNAME" = "FreeBSD" ]; then
+	$IPFW add $src_str
+	return
+    fi;
+
+    ExplodeStr "$src_str" " "
+
+    i=0
+    n=0
+
+    for x in $arr; do
+    	let i=i+1
+    	let n=i+1
+    	let nn=i+2
+    	if [ "${x}" = "fwd" ] || [ "${x}" = "forward" ]; then
+    		act="dnat"
+    		dnat_dst=${RET_ARR[i]}
+    	elif [ "${x}" == "divert" ]; then
+    	    act="divert"
+    	    divert_type=${RET_ARR[i]}
+    	    snat_ip=${RET_ARR[n]}
+    	elif [ "${x}" == "deny" ] || [ "${x}" == "drop" ] || [ "${x}" == "allow" ] || [ "${x}" == "accept" ] || [ "${x}" == "pass" ] || [ "${x}" == "permit" ]; then
+    		act=${x};
+    	elif [ "${x}" == "gre" ] || [ "${x}" == "icmp" ] || [ "${x}" == "ip" ] || [ "${x}" == "tcp" ] || [ "${x}" == "udp" ]; then
+    		proto=${x};
+    	elif [ "${x}" == "log" ]; then
+    		log="log"
+    	elif [ "${x}" == "from" ]; then
+    		from=${RET_ARR[i]}
+    		if [ "${RET_ARR[n]}" != "" ] && [ "${RET_ARR[n]}" != "to" ]; then
+    			from_port=${RET_ARR[n]}
+			fi;
+    	elif [ "${x}" == "to" ]; then
+    		to=${RET_ARR[i]}
+    		if [ "${RET_ARR[n]}" != "" ] && [ "${RET_ARR[n]}" != "in" ] && [ "${RET_ARR[n]}" != "out" ] && [ "${RET_ARR[n]}" != "via" ]; then
+    			to_port=${RET_ARR[n]}
+			fi;    		
+    	elif [ "${x}" == "in" ] || [ "${x}" == "out" ]; then
+    		direction=${x};
+    	elif [ "${x}" == "via" ]; then
+    		via=${RET_ARR[i]}
+    	fi;
+    done;
+    
+    if [ "$act" == "allow" ] || [ "$act" == "accept" ] || [ "$act" == "pass" ] || [ "$act" == "permit" ]; then
+    	action="ACCEPT"
+    elif [ "$act" == "drop" ] || [ "$act" == "deny" ]; then 
+    	action="DROP"
+    else
+    	action=""
+    fi;
+    
+    if [ "$act" = "divert" ]; then
+	if [ "$divert_type" = "nat" ]; then
+	    SNAT "$snat_ip" "$via" "$from" "$from_port" "$to" "$to_port"
+	else
+	    MASQ "$via" "$from" "$from_port" "$to" "$to_port"
+	fi;
+    	
+    elif [ "$act" = "dnat" ]; then
+    	DNAT "$dnat_dst" "$via" "$proto" "$from" "$from_port" "$to" "$to_port"
+    elif [ "$from" = "me" ]; then
+    	OUTPUT "$action" "$via" "$proto" "$to" "$to_port"
+    elif [ "$to" = "me" ]; then
+   		INPUT "$action" "$via" "$proto" "$from" "$from_port" "$to_port"
+#    elif [ "$action" != "" ] && [ "$to" = "any" ] && [ "$from" = "any" ]; then
+#		INPUT "$action" "$via" "$proto" "$from" "$from_port" "$to_port"
+#		OUTPUT "$action" "$via" "$proto" "$to" "$to_port"
+#		FORWARD "$action" "$via" "$proto" "$from" "$from_port" "$to" "$to_port"
+	elif [ "$action" != "" ]; then
+		FORWARD "$action" "$via" "$proto" "$from" "$from_port" "$to" "$to_port"
+   	else
+   		echo "Unknown command: $src_str"
+    fi;
+}
+
+Usage(){
+    echo "Usage: firewall [options]"
+    echo "  -h: This help"
+    echo "  -e: Change firewall rules"
+    echo "  -d: Disable/allow to all firewall"
+    echo "  -t: Test firewall"
+    echo "  -x: Edit firewall script"
+    echo "  -l: Print firewall rules file"
+    echo "  -i: Print iptables rules"
+    echo "==Simple rules===================="
+    echo "flush"
+    echo "trusted_int lo"
+    echo "established"
+    echo "allow all from me to any"
+    echo "forward 192.168.0.1:22 tcp from any to me via eth0"
+    echo "divert nat from 192.168.0.0/24 to any via eth1"
+    echo "close"
+    exit 0;
+}
+
+EditFirewallScript(){
+    $EDITOR $0;
+    exit 0;
+}
+
+PrintFirewallRulesFile(){
+    [ -f $RULES_FILE ] && cat $RULES_FILE || echo "Rules file not found, make '$0' -a to create it."
+    exit 0;
+}
+
+PrintMenu(){
+   	cat $RULES_FILE
+	echo -n "Apply(a), test(t), exit(x) or edit(e)?: "
+	read d
+	[ "$d" = "a" ] && $0 -a
+	[ "$d" = "e" ] && $0 -e
+	[ "$d" = "x" ] && mv -f $RULES_FILE.bak $RULES_FILE
+	[ "$d" = "t" ] && $0 -t
+}
+
+EditRules(){
+    [ ! -f $RULES_FILE ] && WriteDefaultRules;
+    MD5_BEFORE=`$MD5 $RULES_FILE | awk '{ print $1}'`
+    cp -f $RULES_FILE $RULES_FILE.bak
+    $EDITOR $RULES_FILE
+    
+    MD5_AFTER=`$MD5 $RULES_FILE | awk '{ print $1}'`
+    if [ ! "$MD5_BEFORE" = "$MD5_AFTER" ]; then
+    	changes=`diff $RULES_FILE $RULES_FILE.bak`
+    	log "Changes: $changes"
+    	echo "" >> $LOG_FILE
+    	PrintMenu
+    fi
+    exit 0
+}
+
+PrintIptablesRules(){
+	if [ "$UNAME" = "Darwin" ] || [ "$UNAME" = "FreeBSD" ]; then
+		$IPFW list
+	else
+	    echo ========================================================================================
+	    $IPTABLES -L -nv --line-numbers
+	    echo ""
+	    $IPTABLES -t nat -L -nv --line-numbers
+	    echo ========================================================================================
+	fi
+    exit 0
+}
+
+SaveRules(){
+	if [ "$UNAME" = "Darwin" ] || [ "$UNAME" = "FreeBSD" ]; then
+		$IPFW list
+	else
+	    service iptables save
+	fi
+}
+
+[ "$1" = "-h" ] && Usage;
+[ "$1" = "-x" ] && EditFirewallScript;
+[ "$1" = "-e" ] && EditRules;
+[ "$1" = "-l" ] && PrintFirewallRulesFile;
+[ "$1" = "-i" ] && PrintIptablesRules;
+[ "$1" = "-t" ] && DEBUG=1;
+
+if [ "$1" = "-m" ]; then
+	PrintMenu;
+	exit 0;
+fi;
+
+if [ "$1" = "" ]; then
+    EditRules;
+fi
+
+if [ "$DEBUG" -eq 1 ]; then
+	IPTABLES="echo $IPTABLES"
+	IPFW="echo $IPFW"
+fi;
+
+cat $RULES_FILE | while read line ; do
+
+    [ "$line" = "" ] && continue;
+    [ "${line:0:1}" = "#" ] && continue;
+
+    ExplodeStr "$line" " "
+    action=${RET_ARR[0]}
+
+    # Сброс всех правил
+    if [ "$action" = "flush" ]; then
+    	flush
+	elif [ "$action" = "set" ]; then
+    	set_varible ${RET_ARR[1]} ${RET_ARR[2]}
+    elif [ "$action" = "trusted_int" ]; then
+    	trusted_int "${RET_ARR[1]}";
+    elif [ "$action" = "established" ]; then
+    	established;
+    elif [ "$action" = "open" ]; then
+	rules "allow all from any to me"
+	rules "allow all from me to any"
+	rules "allow all from any to any"
+    elif [ "$action" = "close" ]; then
+	rules "deny all from any to me"
+	rules "deny all from me to any"
+	rules "deny all from any to any"
+    else
+    	line=`echo $line`
+    	rules "$line"
+    fi;
+done
+
+if [ "$DEBUG" -eq 1 ] && [ "$1" != "-a" ]; then
+	echo -n "Press any key to continue ..."
+	read
+	$0 -m
+else
+    if [ "$ALWAYS_SAVE" = "yes" ]; then
+	SaveRules
+    else
+	if [ "$SAVE" = "yes" ]; then
+	    echo -n "Save firewall rules on system?[y/N]: "
+	    read d
+	    [ "$d" = "y" ] && SaveRules
+	fi;
+    fi;
+fi;
